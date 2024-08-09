@@ -1,4 +1,9 @@
 import os
+os.environ["CUDA_VISIBLE_DEVICES"]='3'
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"]='true'
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]='.50'
+
+
 from collections import defaultdict
 from functools import partial
 
@@ -15,6 +20,8 @@ import tensorflow as tf
 import tqdm
 from flax.metrics import tensorboard
 from flax.training.train_state import TrainState
+from omegaconf import OmegaConf
+import wandb
 
 from tdmpc2_jax import TDMPC2, WorldModel
 from tdmpc2_jax.common.activations import mish, simnorm
@@ -37,9 +44,21 @@ def train(cfg: dict):
   ##############################
   # Logger setup
   ##############################
+  _wandb = None
+  if cfg.use_wandb:
+    wandb.init(
+      project=cfg.wandb_project,
+      entity=cfg.wandb_entity,
+      group=f"{cfg.env.env_id}",
+      sync_tensorboard=True,
+      config=OmegaConf.to_container(cfg),
+      name=f"{cfg.env.env_id}_iter{cfg.tdmpc2.mppi_iterations}_horizon{cfg.tdmpc2.horizon}",
+      save_code=True,
+    )
+    _wandb=wandb
   output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
   writer = tensorboard.SummaryWriter(os.path.join(output_dir, 'tensorboard'))
-  writer.hparams(cfg)
+  # writer.hparams(cfg)
 
   ##############################
   # Environment setup
@@ -61,12 +80,28 @@ def train(cfg: dict):
       return env
     raise ValueError("Environment not supported:", env_config)
 
-  vector_env_cls = gym.vector.AsyncVectorEnv if env_config.asynchronous else gym.vector.SyncVectorEnv
-  env = vector_env_cls(
-      [
-          partial(make_env, env_config, seed)
-          for seed in range(cfg.seed, cfg.seed+env_config.num_envs)
-      ])
+  if env_config.backend in ["dmc", "gymnasium"]:
+    vector_env_cls = gym.vector.AsyncVectorEnv if env_config.asynchronous else gym.vector.SyncVectorEnv
+    env = vector_env_cls(
+        [
+            partial(make_env, env_config, seed)
+            for seed in range(cfg.seed, cfg.seed+env_config.num_envs)
+        ])
+  elif env_config.backend == "maniskill":
+    from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
+    from tdmpc2_jax.envs.maniskill import ManiSkillNumpyWrapper, ManiskillVideoRecorder
+    import mani_skill.envs
+    env = gym.make(
+      cfg.env.env_id,
+      obs_mode=cfg.env.maniskill.obs_mode,
+      control_mode=cfg.env.maniskill.control_mode,
+      render_mode=cfg.env.maniskill.render_mode,
+      num_envs=cfg.env.num_envs
+    )
+    env = ManiSkillVectorEnv(env, ignore_terminations=True)
+    env = ManiSkillNumpyWrapper(env)
+    _video = ManiskillVideoRecorder(cfg, _wandb) if _wandb and cfg.env.maniskill.save_video else None
+
   np.random.seed(cfg.seed)
   rng = jax.random.PRNGKey(cfg.seed)
 
@@ -176,11 +211,21 @@ def train(cfg: dict):
     )
     observation, _ = env.reset(seed=cfg.seed)
 
-    T = 500
-    seed_steps = int(max(5*T, 1000) * env_config.num_envs *
+    T = env.max_episode_steps if cfg.env.backend=='maniskill' else 500
+    seed_steps = int(max(cfg.env.num_envs * T, 1000) * env_config.num_envs *
                      env_config.utd_ratio)
     pbar = tqdm.tqdm(initial=global_step, total=cfg.max_steps)
+
+    prev_eval_step = 0
+    eval_next: bool = True # evaluate immediately
+
     for global_step in range(global_step, cfg.max_steps, env_config.num_envs):
+      if eval_next:
+        rng, eval_rng = jax.random.split(rng)
+        eval_metrics = evaluate(cfg, env, agent, _video, global_step, eval_rng)
+        for k, v in eval_metrics.items():
+          writer.scalar(f'eval/{k}', v, global_step)
+        eval_next = False
       if global_step <= seed_steps:
         action = env.action_space.sample()
       else:
@@ -209,21 +254,32 @@ def train(cfg: dict):
       # Handle terminations/truncations
       done = np.logical_or(terminated, truncated)
       if np.any(done):
+        assert np.all(done) # added, I think this is the same for maniskill and others
+        eval_next: bool = (global_step // cfg.eval_freq > prev_eval_step // cfg.eval_freq)
+        prev_eval_step = global_step if eval_next else prev_eval_step
+
         prev_plan = (
             prev_plan[0].at[done].set(0),
             prev_plan[1].at[done].set(agent.max_plan_std)
         )
       if "final_info" in info:
-        for ienv, final_info in enumerate(info["final_info"]):
-          if final_info is None:
-            continue
-          print(
-              f"Episode {ep_count[ienv]}: {final_info['episode']['r'][0]:.2f}, {final_info['episode']['l'][0]}")
-          writer.scalar(f'episode/return',
-                        final_info['episode']['r'], global_step + ienv)
-          writer.scalar(f'episode/length',
-                        final_info['episode']['l'], global_step + ienv)
-          ep_count[ienv] += 1
+        if cfg.env.backend != 'maniskill':
+          for ienv, final_info in enumerate(info["final_info"]):
+            if final_info is None:
+              continue
+            print(
+                f"Episode {ep_count[ienv]}: {final_info['episode']['r'][0]:.2f}, {final_info['episode']['l'][0]}")
+            writer.scalar(f'episode/return',
+                          final_info['episode']['r'], global_step + ienv)
+            writer.scalar(f'episode/length',
+                          final_info['episode']['l'], global_step + ienv)
+            ep_count[ienv] += 1
+        else: # maniskill
+          for i in range(cfg.env.num_envs):
+            print(f"Episode {ep_count[i]}: {info['final_info']['episode']['r'][i]:.2f}, success: {info["success"][i]}")
+            writer.scalar(f'episode/return', info['final_info']['episode']['r'][i], global_step + i)
+            ep_count[i] += 1
+          writer.scalar(f'episode/success', info["success"].mean(), global_step)
 
       if global_step >= seed_steps:
         if global_step == seed_steps:
@@ -270,7 +326,55 @@ def train(cfg: dict):
 
       pbar.update(env_config.num_envs)
     pbar.close()
+    writer.close()
+    wandb.finish()
 
+def evaluate(cfg, env, agent, video_logger, global_step, rng):
+  """Evaluate a TD-MPC2 agent."""
+  print("Evaluating")
+  has_success, has_fail = False, False # if task has success or/and fail (added for maniskill)
+  ep_rewards, ep_successes, ep_fails = [], [], []
+  prev_plan = (
+      jnp.zeros((cfg.env.num_envs, cfg.tdmpc2.horizon, agent.model.action_dim)),
+      jnp.full((cfg.env.num_envs, agent.horizon,
+                agent.model.action_dim), agent.max_plan_std)
+  )
+  for i in range((cfg.eval_episodes - 1) // cfg.env.num_envs + 1):
+    observation, _ = env.reset()
+    rng, action_key = jax.random.split(rng)
+    prev_plan = (prev_plan[0], jnp.full_like(prev_plan[1], agent.max_plan_std))
+    ep_reward, t = np.zeros((cfg.env.num_envs, )), 0
+    done = np.full_like(ep_reward, False)
+    if cfg.env.backend == 'maniskill' and cfg.env.maniskill.save_video:
+      assert video_logger is not None
+      video_logger.init(env, enabled=(i==0))
+    while not done[0]:
+      action, prev_plan = agent.act(observation, prev_plan=prev_plan, train=False, key=action_key)
+      observation, reward, terminated, truncated, info = env.step(action)
+      done = np.logical_or(terminated, truncated)
+      ep_reward += reward
+      t += 1
+      if cfg.env.backend == 'maniskill' and cfg.env.maniskill.save_video:
+        video_logger.record(env)
+    ep_rewards.append(ep_reward.mean())
+    if 'success' in info: 
+      has_success = True
+      ep_successes.append(info['success'].mean())
+    if 'fail' in info:
+      has_fail = True
+      ep_fails.append(info['fail'].mean())
+    if cfg.env.backend == 'maniskill' and cfg.env.maniskill.save_video:
+      video_logger.save(global_step)
+  
+  eval_metrics = dict(
+    episode_reward=np.nanmean(ep_rewards),
+  )
+  if has_success:
+    eval_metrics.update(episode_success=np.nanmean(ep_successes))
+  if has_fail:
+    eval_metrics.update(episode_fail=np.nanmean(ep_fails))
+  print(f"Evaluation at step={global_step} -- {eval_metrics}")
+  return eval_metrics
 
 if __name__ == '__main__':
   train()

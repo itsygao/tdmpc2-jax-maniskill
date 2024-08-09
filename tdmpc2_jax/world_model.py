@@ -236,6 +236,7 @@ class WorldModel(struct.PyTreeNode):
                      *,
                      key: PRNGKeyArray
                      ) -> Tuple[jax.Array, ...]:
+    """return action, mean, log_std, log_probs"""
     # Chunk the policy model output to get mean and logstd
     mu, log_std = jnp.split(self.policy_model.apply_fn(
         {'params': params}, z), 2, axis=-1)

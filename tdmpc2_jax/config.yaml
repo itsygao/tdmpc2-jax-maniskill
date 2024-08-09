@@ -10,18 +10,24 @@ save_interval_steps: 100000
 log_interval_steps: 10000
 
 env:
-  backend: gymnasium
-  env_id: HalfCheetah-v4
-  num_envs: 4
+  backend: maniskill
+  env_id: PickCube-v1
+  num_envs: 16
   utd_ratio: 0.5
   asynchronous: True
 
   dmc: { obs_type: state }
+  maniskill:
+    save_video: true
+    obs_mode: state
+    control_mode: pd_ee_delta_pos
+    render_mode: rgb_array # ['rgb_array' for quality, or 'sensors' for speed]
+
 
 encoder:
   encoder_dim: 256
   num_encoder_layers: 2
-  learning_rate: 1e-4
+  learning_rate: 3e-4
   tabulate: False
 
 world_model:
@@ -61,3 +67,17 @@ tdmpc2:
   value_coef: 0.1
   entropy_coef: 1e-4
   tau: 0.01
+
+# added
+use_wandb: true
+wandb_project: jax-tdmpc2
+wandb_entity: itsygao
+
+eval_freq: 50000
+eval_episodes: 10
+
+# others
+exp_name: default # video
+
+# convenience
+work_dir: ??? # video

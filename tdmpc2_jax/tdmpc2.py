@@ -104,7 +104,6 @@ class TDMPC2(struct.PyTreeNode):
             jnp.full((num_envs, self.horizon, self.model.action_dim),
                      self.max_plan_std)
         )
-
       action, plan = self.plan(
           jnp.atleast_2d(z), prev_plan, train, jax.random.split(key, num_envs))
       action = action.squeeze(0) if z.ndim == 1 else action
@@ -120,7 +119,7 @@ class TDMPC2(struct.PyTreeNode):
   @partial(jax.vmap, in_axes=(None, 0, 0, None, 0), out_axes=0)
   def plan(self,
            z: jax.Array,
-           prev_plan: Tuple[jax.Array, jax.Array],
+           prev_plan: Tuple[jax.Array, jax.Array], 
            train: bool,
            key: PRNGKeyArray,
            ) -> Tuple[jax.Array, jax.Array]:
@@ -144,12 +143,13 @@ class TDMPC2(struct.PyTreeNode):
         - Action output from planning
         - Final mean value (for use in warm start)
     """
-    z = jnp.atleast_2d(z)
+    z = jnp.atleast_2d(z) # before vmap, (1, latent_dim) guaranteed 2d
+    # prev_plan: before vmap, tuple of (horizon, action_dim)
     # Sample trajectories from policy prior
     key, *prior_keys = jax.random.split(key, self.horizon + 1)
     policy_actions = jnp.zeros(
         (self.horizon, self.policy_prior_samples, self.model.action_dim))
-    _z = z.repeat(self.policy_prior_samples, axis=0)
+    _z = z.repeat(self.policy_prior_samples, axis=0) # (policy_prior_samples, latent_dim)
     for t in range(self.horizon-1):
       policy_actions = policy_actions.at[t].set(
           self.model.sample_actions(_z, self.model.policy_model.params, key=prior_keys[t])[0])
@@ -159,12 +159,12 @@ class TDMPC2(struct.PyTreeNode):
         self.model.sample_actions(_z, self.model.policy_model.params, key=prior_keys[-1])[0])
 
     # Initialize population state
-    z = z.repeat(self.population_size, axis=0)
+    z = z.repeat(self.population_size, axis=0) # (population_size=num_samples, latent_dim)
     mean = jnp.zeros((self.horizon, self.model.action_dim))
     std = jnp.full((self.horizon, self.model.action_dim), self.max_plan_std)
     # Warm start MPPI with the previous solution
     mean = mean.at[:-1].set(prev_plan[0][1:])
-    std = std.at[:-1].set(prev_plan[1][1:])
+    # std = std.at[:-1].set(prev_plan[1][1:])
 
     actions = jnp.zeros(
         (self.horizon, self.population_size, self.model.action_dim))
@@ -350,9 +350,11 @@ class TDMPC2(struct.PyTreeNode):
 
       # Compute policy objective (equation 4)
       rho = self.rho ** jnp.arange(self.horizon+1)
+      policy_loss_entropy = self.entropy_coef * log_probs
       policy_loss = ((self.entropy_coef * log_probs -
                      Q).mean(axis=1) * rho).mean()
-      return policy_loss, {'policy_loss': policy_loss, 'policy_scale': scale}
+      return policy_loss, {'policy_loss': policy_loss, 'policy_scale': scale, 
+                           ''}
     policy_grads, policy_info = jax.grad(policy_loss_fn, has_aux=True)(
         self.model.policy_model.params)
     new_policy = self.model.policy_model.apply_gradients(grads=policy_grads)
