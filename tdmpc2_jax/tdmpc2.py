@@ -220,12 +220,12 @@ class TDMPC2(struct.PyTreeNode):
 
   @jax.jit
   def update(self,
-             observations: jax.Array,
-             actions: jax.Array,
-             rewards: jax.Array,
-             next_observations: jax.Array,
-             terminated: jax.Array,
-             truncated: jax.Array,
+             observations: jax.Array,                  # observations (horizon, batch_sz, obs_dim)
+             actions: jax.Array,                       # actions (horizon, batch_sz)
+             rewards: jax.Array,                       # rewards (horizon, batch_sz)
+             next_observations: jax.Array,             # next_observations (horizon, batch_sz, obs_dim)
+             terminated: jax.Array,                    # terminated (horizon, batch_sz)
+             truncated: jax.Array,                     # truncated (horizon, batch_sz)
              *,
              key: PRNGKeyArray
              ) -> Tuple[TDMPC2, Dict[str, Any]]:
@@ -239,30 +239,31 @@ class TDMPC2(struct.PyTreeNode):
                             continue_params: Dict):
       target_key, Q_key = jax.random.split(world_model_key, 2)
       done = jnp.logical_or(terminated, truncated)
-      finished = jnp.zeros((self.horizon+1, self.batch_size), dtype=bool)
+      finished = jnp.zeros((self.horizon+1, self.batch_size), dtype=bool)        # finished (horizon+1, batch_size)
+                                                                                 # if finished[i], then obs[i] -> a[i] x->x next_obs[i] don't work
 
-      next_z = sg(self.model.encode(next_observations, encoder_params))
-      td_targets = self.td_target(next_z, rewards, terminated, key=target_key)
+      next_z = sg(self.model.encode(next_observations, encoder_params))          # next_z (horizon, batch_sz, latent_dim)
+      td_targets = self.td_target(next_z, rewards, terminated, key=target_key)   # td_targets (horizon, batch_sz)
 
       # Latent rollout (compute latent dynamics + consistency loss)
-      zs = jnp.zeros((self.horizon+1, self.batch_size, next_z.shape[-1]))
+      zs = jnp.zeros((self.horizon+1, self.batch_size, next_z.shape[-1]))        # zs (horizon+1, batch_size, latent_dim)
       z = self.model.encode(jax.tree.map(
-          lambda x: x[0], observations), encoder_params)
+          lambda x: x[0], observations), encoder_params)                         # z (horizon, batch_sz, latent_dim)
       zs = zs.at[0].set(z)
       consistency_loss = 0
-      for t in range(self.horizon):
+      for t in range(self.horizon):                                              # filling in zs with imagined z
         z = self.model.next(z, actions[t], dynamics_params)
         zs = zs.at[t+1].set(z)
         consistency_loss += self.rho**t * \
             jnp.mean((z - next_z[t])**2, where=~finished[t][:, None])
 
         # Keep track of which trajectories have reached a terminal state
-        finished = finished.at[t+1].set(jnp.logical_or(finished[t], done[t]))
+        finished = finished.at[t+1].set(jnp.logical_or(finished[t], done[t]))    # last finished[-1] do what? seems unused later.
 
       # Get logits for loss computations
       _, q_logits = self.model.Q(zs[:-1], actions, value_params, key=Q_key)
       _, reward_logits = self.model.reward(zs[:-1], actions, reward_params)
-      if self.model.predict_continues:
+      if self.model.predict_continues:                                           # ?
         continue_logits = self.model.continue_model.apply_fn(
             {'params': continue_params}, zs[1:]).squeeze(-1)
 
@@ -337,24 +338,49 @@ class TDMPC2(struct.PyTreeNode):
 
     # Update policy
     def policy_loss_fn(params: Dict):
-      action_key, Q_key = jax.random.split(policy_key, 2)
-      actions, _, _, log_probs = self.model.sample_actions(
+      action_key, Q_key, ensemble_key = jax.random.split(policy_key, 3)
+      actions, _, _, log_probs = self.model.sample_actions(                    # log_probs (horizon+1, batch_size)
           zs, params, key=action_key)
 
       # Compute Q-values
-      Qs, _ = self.model.Q(zs, actions, new_value_model.params, key=Q_key)
-      Q = Qs.mean(axis=0)
+      Qs, _ = self.model.Q(zs, actions, new_value_model.params, key=Q_key)     # Qs (num_qs, horizon+1, batch_size)
+
+      # Yuan: added to conform to the original implementation
+      # Sample two Q-values from the target ensemble
+      inds = jax.random.choice(ensemble_key,
+                             jnp.arange(0, self.model.num_value_nets),
+                             shape=(2, ), replace=False)
+
+      Q = Qs[inds].mean(axis=0)                                                # Q (horizon+1, batch_size)
       # Update and apply scale
       scale = percentile_normalization(Q[0], self.scale).clip(1, None)
-      Q = Q / sg(scale)
+      Q = Q / sg(scale)                                                        # Q (horizon+1, batch_size)
 
       # Compute policy objective (equation 4)
       rho = self.rho ** jnp.arange(self.horizon+1)
       policy_loss_entropy = self.entropy_coef * log_probs
       policy_loss = ((self.entropy_coef * log_probs -
                      Q).mean(axis=1) * rho).mean()
-      return policy_loss, {'policy_loss': policy_loss, 'policy_scale': scale, 
-                           ''}
+      return policy_loss, {'policy_loss': policy_loss, 'policy_scale': scale, }
+
+    # def policy_loss_fn(params: Dict): # original
+    #   action_key, Q_key = jax.random.split(policy_key, 2)
+    #   actions, _, _, log_probs = self.model.sample_actions(
+    #       zs, params, key=action_key)
+
+    #   # Compute Q-values
+    #   Qs, _ = self.model.Q(zs, actions, new_value_model.params, key=Q_key)
+    #   Q = Qs.mean(axis=0)
+    #   # Update and apply scale
+    #   scale = percentile_normalization(Q[0], self.scale).clip(1, None)
+    #   Q = Q / sg(scale)
+
+    #   # Compute policy objective (equation 4)
+    #   rho = self.rho ** jnp.arange(self.horizon+1)
+    #   policy_loss = ((self.entropy_coef * log_probs -
+    #                  Q).mean(axis=1) * rho).mean()
+    #   return policy_loss, {'policy_loss': policy_loss, 'policy_scale': scale}
+
     policy_grads, policy_info = jax.grad(policy_loss_fn, has_aux=True)(
         self.model.policy_model.params)
     new_policy = self.model.policy_model.apply_gradients(grads=policy_grads)
@@ -390,18 +416,55 @@ class TDMPC2(struct.PyTreeNode):
 
       discount *= self.discount * continues
 
-    action_key, Q_key = jax.random.split(key, 2)
+    action_key, Q_key, ensemble_key = jax.random.split(key, 3)
     next_action = self.model.sample_actions(
         z, self.model.policy_model.params, key=action_key)[0]
 
     Qs, _ = self.model.Q(
         z, next_action, self.model.value_model.params, key=Q_key)
-    Q = Qs.mean(axis=0)
+    
+    # Yuan: conform to the original tdmpc2
+    # Sample two Q-values from the target ensemble
+    inds = jax.random.choice(ensemble_key,
+                             jnp.arange(0, self.model.num_value_nets),
+                             shape=(2, ), replace=False)
+    Q = Qs[inds].mean(axis=0)
     return sg(G + discount * Q)
+
+#   @jax.jit
+#   def estimate_value(self, z: jax.Array, actions: jax.Array, key: PRNGKeyArray) -> jax.Array: # original
+#     G, discount = 0.0, 1.0
+#     for t in range(self.horizon):
+#       reward, _ = self.model.reward(
+#           z, actions[t], self.model.reward_model.params)
+#       z = self.model.next(z, actions[t], self.model.dynamics_model.params)
+#       G += discount * reward.astype(jnp.float32)
+
+#       if self.model.predict_continues:
+#         continues = jax.nn.sigmoid(self.model.continue_model.apply_fn(
+#             {'params': self.model.continue_model.params}, z)).squeeze(-1) > 0.5
+#       else:
+#         continues = 1.0
+
+#       discount *= self.discount * continues
+
+#     action_key, Q_key = jax.random.split(key, 2)
+#     next_action = self.model.sample_actions(
+#         z, self.model.policy_model.params, key=action_key)[0]
+
+#     Qs, _ = self.model.Q(
+#         z, next_action, self.model.value_model.params, key=Q_key)
+#     Q = Qs.mean(axis=0)
+#     return sg(G + discount * Q)
 
   @jax.jit
   def td_target(self, next_z: jax.Array, reward: jax.Array, terminal: jax.Array,
                 key: PRNGKeyArray) -> jax.Array:
+    """
+    next_z (horizon, batch_sz, latent_dim)
+    reward (horizon, batch_sz)
+    Return: Q (horizon, batch_sz)
+    """
     action_key, ensemble_key, Q_key = jax.random.split(key, 3)
     next_action = self.model.sample_actions(
         next_z, self.model.policy_model.params, key=action_key)[0]

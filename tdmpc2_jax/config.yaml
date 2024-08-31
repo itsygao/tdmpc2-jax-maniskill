@@ -9,19 +9,23 @@ max_steps: 1_000_000
 save_interval_steps: 100000
 log_interval_steps: 10000
 
+buffer_size: 1_000_000
+
 env:
   backend: maniskill
   env_id: PickCube-v1
-  num_envs: 16
+  num_envs: 64
+  num_eval_envs: 16
   utd_ratio: 0.5
   asynchronous: True
 
   dmc: { obs_type: state }
   maniskill:
     save_video: true
+    ignore_terminations: false
     obs_mode: state
     control_mode: pd_ee_delta_pos
-    render_mode: rgb_array # ['rgb_array' for quality, or 'sensors' for speed]
+    render_mode: sensors # ['rgb_array' for quality, or 'sensors' for speed]
 
 
 encoder:
@@ -72,9 +76,10 @@ tdmpc2:
 use_wandb: true
 wandb_project: jax-tdmpc2
 wandb_entity: itsygao
+wandb_name: ???
 
 eval_freq: 50000
-eval_episodes: 10
+eval_episodes: 64
 
 # others
 exp_name: default # video
