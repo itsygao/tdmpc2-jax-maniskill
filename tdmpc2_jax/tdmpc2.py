@@ -243,6 +243,8 @@ class TDMPC2(struct.PyTreeNode):
                                                                                  # if finished[i], then obs[i] -> a[i] x->x next_obs[i] don't work
 
       next_z = sg(self.model.encode(next_observations, encoder_params))          # next_z (horizon, batch_sz, latent_dim)
+    #   next_z_grad = self.model.encode(observations, encoder_params)
+    #   next_z = sg(self.model.encode(next_observations, encoder_params))
       td_targets = self.td_target(next_z, rewards, terminated, key=target_key)   # td_targets (horizon, batch_sz)
 
       # Latent rollout (compute latent dynamics + consistency loss)
@@ -263,6 +265,8 @@ class TDMPC2(struct.PyTreeNode):
       # Get logits for loss computations
       _, q_logits = self.model.Q(zs[:-1], actions, value_params, key=Q_key)
       _, reward_logits = self.model.reward(zs[:-1], actions, reward_params)
+    #   _, q_logits = self.model.Q(next_z_grad, actions, value_params, key=Q_key)
+    #   _, reward_logits = self.model.reward(next_z_grad, actions, reward_params)
       if self.model.predict_continues:                                           # ?
         continue_logits = self.model.continue_model.apply_fn(
             {'params': continue_params}, zs[1:]).squeeze(-1)

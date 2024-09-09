@@ -12,7 +12,8 @@ class ListSet():
 
     def add(self, item):
         if item in self.pos_dict:
-            return
+            # return
+            raise Exception
         self.items.append(item)
         self.pos_dict[item] = len(self.items)-1
 
@@ -117,8 +118,8 @@ class NewSequentialReplayBuffer():
         self.breaks[idx].append(self.breaks[idx][-1])
         self.traj_lens[idx].append(0)
       
-      # if self.np_random.rand() < 0.02:
-      #   print(f"capa {self.capacity}, breaks {self.breaks[0]}, lens {self.traj_lens[0]}, good {self.good_starts[0]}")
+      # if self.np_random.rand() < 0.0002:
+      #   print(f"capa {self.capacity}, breaks {self.breaks[0]}, lens {self.traj_lens[0]}, good {sorted(self.good_starts[0].items) if len(self.good_starts[0].items) < 2000 else -1}")
   
   def get_state(self) -> Dict:
     # Yuan: need extra work to restore

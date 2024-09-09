@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"]='2'
+os.environ["CUDA_VISIBLE_DEVICES"]='0'
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"]='true'
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]='.60'
 
@@ -141,10 +141,10 @@ def train(cfg: dict):
   dummy_action = env.action_space.sample()
   dummy_next_obs, dummy_reward, dummy_term, dummy_trunc, _ = \
       env.step(dummy_action)
-  replay_buffer = OrigSequentialReplayBuffer(
+  replay_buffer = NewSequentialReplayBuffer(
       capacity=cfg.buffer_size//env_config.num_envs,
       num_envs=env_config.num_envs,
-      # sequence_length=cfg.tdmpc2.horizon,
+      sequence_length=cfg.tdmpc2.horizon, #
       seed=cfg.seed,
       dummy_input=dict(
           observation=dummy_obs,
@@ -228,7 +228,9 @@ def train(cfg: dict):
     prev_eval_step = 0
     eval_next: bool = True # evaluate immediately
 
+    train_after_collect = False
     for global_step in range(global_step, cfg.max_steps, env_config.num_envs):
+      train_after_collect =  global_step // (cfg.env.steps_per_env * env_config.num_envs) - (global_step - env_config.num_envs) // (cfg.env.steps_per_env * env_config.num_envs) > 0
       if eval_next:
         rng, eval_rng = jax.random.split(rng)
         eval_metrics = evaluate(cfg, eval_env, agent, _video, global_step, eval_rng)
@@ -260,7 +262,7 @@ def train(cfg: dict):
           next_observation=real_next_observation,
           terminated=terminated,
           truncated=truncated), 
-          # done
+          done #
           )
       observation = next_observation
 
@@ -311,43 +313,44 @@ def train(cfg: dict):
           print('Pre-training on seed data...')
           num_updates = seed_steps
         else:
-          num_updates = max(1, int(env_config.num_envs * env_config.utd_ratio))
+          num_updates = max(1, int(env_config.num_envs * cfg.env.steps_per_env * env_config.utd_ratio))
 
-        rng, *update_keys = jax.random.split(rng, num_updates+1)
-        log_this_step = global_step >= prev_logged_step + \
-            cfg['log_interval_steps']
-        if log_this_step:
-          all_train_info = defaultdict(list)
-          prev_logged_step = global_step
+        if train_after_collect:
+          rng, *update_keys = jax.random.split(rng, num_updates+1)
+          log_this_step = global_step >= prev_logged_step + \
+              cfg['log_interval_steps']
+          if log_this_step:
+            all_train_info = defaultdict(list)
+            prev_logged_step = global_step
 
-        for iupdate in range(num_updates):
-          batch = replay_buffer.sample(agent.batch_size, agent.horizon)
-          agent, train_info = agent.update(
-              observations=batch['observation'],
-              actions=batch['action'],
-              rewards=batch['reward'],
-              next_observations=batch['next_observation'],
-              terminated=batch['terminated'],
-              truncated=batch['truncated'],
-              key=update_keys[iupdate])
+          for iupdate in range(num_updates):
+            batch = replay_buffer.sample(agent.batch_size, agent.horizon)
+            agent, train_info = agent.update(
+                observations=batch['observation'],
+                actions=batch['action'],
+                rewards=batch['reward'],
+                next_observations=batch['next_observation'],
+                terminated=batch['terminated'],
+                truncated=batch['truncated'],
+                key=update_keys[iupdate])
+
+            if log_this_step:
+              for k, v in train_info.items():
+                all_train_info[k].append(np.array(v))
 
           if log_this_step:
-            for k, v in train_info.items():
-              all_train_info[k].append(np.array(v))
+            for k, v in all_train_info.items():
+              writer.scalar(f'train/{k}_mean', np.mean(v), global_step)
+              writer.scalar(f'train/{k}_std', np.std(v), global_step)
 
-        if log_this_step:
-          for k, v in all_train_info.items():
-            writer.scalar(f'train/{k}_mean', np.mean(v), global_step)
-            writer.scalar(f'train/{k}_std', np.std(v), global_step)
-
-        mngr.save(
-            global_step,
-            args=ocp.args.Composite(
-                agent=ocp.args.StandardSave(agent),
-                global_step=ocp.args.JsonSave(global_step),
-                buffer_state=ocp.args.StandardSave(replay_buffer.get_state()),
-            ),
-        )
+          mngr.save(
+              global_step,
+              args=ocp.args.Composite(
+                  agent=ocp.args.StandardSave(agent),
+                  global_step=ocp.args.JsonSave(global_step),
+                  buffer_state=ocp.args.StandardSave(replay_buffer.get_state()),
+              ),
+          )
 
       pbar.update(env_config.num_envs)
     pbar.close()

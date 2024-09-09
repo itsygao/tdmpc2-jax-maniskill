@@ -6,6 +6,7 @@ from collections import deque
 
 
 class EpisodicReplayBuffer():
+  "Yuan: seems only works when buffer size is max_step"
 
   def __init__(self,
                capacity: int,

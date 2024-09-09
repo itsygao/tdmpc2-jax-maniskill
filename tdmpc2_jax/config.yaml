@@ -17,12 +17,13 @@ env:
   num_envs: 64
   num_eval_envs: 16
   utd_ratio: 0.5
+  steps_per_env: 1 # how many env.steps() called before each gradient step
   asynchronous: True
 
   dmc: { obs_type: state }
   maniskill:
     save_video: true
-    ignore_terminations: false
+    ignore_terminations: true
     obs_mode: state
     control_mode: pd_ee_delta_pos
     render_mode: sensors # ['rgb_array' for quality, or 'sensors' for speed]
@@ -32,7 +33,7 @@ encoder:
   encoder_dim: 256
   num_encoder_layers: 2
   learning_rate: 3e-4
-  tabulate: False
+  tabulate: True
 
 world_model:
   mlp_dim: 512
@@ -48,7 +49,7 @@ world_model:
   predict_continues: False
   dtype: float32
   max_grad_norm: 20
-  tabulate: False
+  tabulate: True
 
 tdmpc2:
   # Planning
